@@ -1,0 +1,578 @@
+---
+title: "R Bootcamp Assignment"
+author: "Tracey Etheridge & Xiying Liu"
+date: "14/02/2021"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+# Analysis of the relationship between Energy Consumption and GDP per Capita worldwide.
+Total energy consumption is the key factor in each country's energy and climate change policy, which is influenced by economic growth, industrialization, urbanization, etc. This analyis chooses one of the most important influencing factors, GDP per capita, to analyze the relationship between these two variables and forecast the energy consumption in the next 5 years, which can be used to assist policy development in energy and climate change fields.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE, fig.align="center", cache=FALSE)
+library(dplyr)
+library(readxl)
+library(tidyr)
+library(stringr)
+library(Amelia) # used for imputation by regression of missing values
+library(ggplot2)
+library(cowplot)
+library(GGally)
+```
+
+### Load Data
+
+**Data sources**
+
+* Energy Consumption data -  sourced from BP Statistical Review of World Energy <https://www.bp.com/en/global/corporate/energy-economics/statistical-review-of-world-energy.html>  
+* GDP per Capita and Country Category data - sourced from the World Bank Open Data <https://data.worldbank.org/>, the unit of GDP per Capita is constant 2010 USD. 
+
+```{r import}
+filepath_energy <- "../data/Energy.xlsx"
+filepath_gdp <- "../data/GDP_per_capita_constantUSD.csv"
+filepath_country_cats <- "../data/Country_categories.csv"
+
+df_energy <- read_excel(filepath_energy, sheet="Primary Energy Consumption", range = "A3:BD109")
+df_gdp <- read.csv(filepath_gdp, skip=4)
+df_country_cats <- read.csv(filepath_country_cats)
+
+#head(df_energy,5)
+#head(df_gdp,5)
+#head(df_country_cats,5)
+```
+
+### Data Cleaning
+
+```{r clean, warning=FALSE}
+# Drop rows where all values are N/A
+df_energy <- df_energy[rowSums(is.na(df_energy)) != ncol(df_energy),]
+df_gdp <- df_gdp[rowSums(is.na(df_gdp)) != ncol(df_gdp),]
+
+# Rename country columns
+colnames(df_energy)[colnames(df_energy) == "Exajoules"] <- "Country_Name"
+colnames(df_gdp)[colnames(df_gdp) == "Country.Name"] <- "Country_Name"
+colnames(df_gdp)[colnames(df_gdp) == "Country.Code"] <- "Country_Code"
+colnames(df_country_cats)[colnames(df_country_cats) == "Country.Code"] <- "Country_Code"
+
+# Remove prefix "X" from year column names in gdp data
+for (colname in colnames(df_gdp)) {
+  if (str_sub(colname, start=1, end=1) == "X") {
+    colnames(df_gdp)[colnames(df_gdp) == colname] <- str_sub(colname, start=2)
+  }
+}
+
+# Drop years before 1990 and columns after 2019
+df_energy <- df_energy[(colnames(df_energy) >= 1990)]
+df_gdp <- df_gdp[(colnames(df_gdp) >= 1990)]
+df_gdp <- df_gdp %>% select(!"2020")
+
+# Mismatch in US name in datasets, align country name - energy = US, gdp = United States
+df_energy$Country_Name[df_energy$Country_Name == "US"] <- "United States"
+
+# Convert values in energy data from character to numeric
+# Note: this generates warning about na's created from coersion, however on inspection these are blank cells in source document
+df_energy[,2:length(colnames(df_energy))] <- lapply(df_energy[,2:length(colnames(df_energy))], as.numeric)
+
+# Add income group to gdp data, IncomeGroup is a categorial variable
+df_gdp <- merge(df_gdp, df_country_cats[,c("Country_Code", "IncomeGroup")], by = c("Country_Code"))
+df_gdp$IncomeGroup <- factor(df_gdp$IncomeGroup, levels = c("Lower middle income", "Upper middle income", "High income"))
+
+# Drop non year columns in gdp data
+df_gdp <- df_gdp %>%
+  select(!c("Indicator.Name", "Indicator.Code"))
+
+# Overview cleaned data
+head(as_tibble(df_energy),5)
+head(as_tibble(df_gdp),5)
+```
+
+### Pivot and Combine Data
+
+```{r data_combine}
+# Transform data to year as column
+df_energy <- df_energy %>%
+  pivot_longer(
+    cols = !Country_Name,
+    names_to = "Year",
+    values_to = "Energy_Exajoules")
+
+df_gdp <- df_gdp %>%
+  pivot_longer(
+    cols = !c(Country_Name, Country_Code, IncomeGroup),
+    names_to = "Year",
+    values_to = "GDP")
+
+# Join data only where there is a Country_Name match (inner join)
+df <- merge(df_energy, df_gdp, by = c("Country_Name", "Year"))
+
+# Change year data type from character to integer
+df$Year <- as.numeric(df$Year)
+
+# Reorder & Rename Columns
+df <- df[,c("Country_Name", "Country_Code", "IncomeGroup", "Year", "Energy_Exajoules", "GDP")]
+colnames(df)[colnames(df) == "IncomeGroup"] <- "Income_Group"
+
+# Overview combined data
+head(df,5)
+```
+
+### Imputation of Missing Values
+
+Inspection of NA data shows the following GDP values (n=35) are missing:
+
+* Croatia, Kuwait, Latvia, Lithuania 1990:1994  
+* Estonia 1990:1991  
+* Hungary 1990  
+* Qatar 1990:1999  
+* Turkmenistan 2019  
+
+These have been imputed using the Amelia package that can perform imputations in a time series cross sectional data set using regression and is particularly useful for dealing with country-year observations.
+Ref: https://cran.r-project.org/web/packages/Amelia/index.html
+
+```{r impute_values, warnings=FALSE, fig.align="center"}
+# Check NA's
+head(df[rowSums(is.na(df)) > 0,],5)
+
+# Impute data by regression using Amelia package
+imput <- amelia(df, 
+                m = 5, # number of imputated data sets to make
+                ts = "Year", # defines time variable
+                cs = "Country_Name", # defines cross section variable
+                polytime = 2, # 1 = linear time effect, 2 = squared, 3 = cubic
+                intercs = TRUE, # time effect varies between countries
+                leads = "GDP", # includes the next time period when imputing
+                lags = "GDP", # includes the prior time period when imputing
+                p2s = 0, # level of info to display during processing 
+                idvars = c("Income_Group", "Country_Code")) # columns to keep but not relevant for imputation. 
+
+# Check imputations and visualise imputed data
+imputed_countries = c("Croatia", "Kuwait", "Latvia", "Lithuania", "Estonia", "Hungary", "Qatar",
+                      "Turkmenistan")
+
+par(mfrow=c(1,1), oma=c(0,0,3,0))
+tscsPlot(imput, 
+         cs = imputed_countries, 
+         var = "GDP",
+         xlab = "",)
+mtext(expression(bold("Imputed GDP Values (" * phantom("Red   ") * ")")), col= "black", outer = TRUE, cex = 1.2)
+mtext(expression(phantom("Imputed GDP Values (") * "Red"), col= "red", outer = TRUE, cex = 1.2)
+
+# Extract data to dataframe using first set of imputed values
+df_imput <- imput$imputations[[1]]
+```
+
+# Data Visualisation & Analysis
+
+The combined yearly data shows a positive linear trend with a deviation in the data around 2008/2009, which we believe correlates to the financial crisis. With the sudden and significant change in economic growth, the energy consumption patterns could have been impacted and changed. 
+
+```{r plot_basic, fig.align="center", fig.width=8, fig.height=5}
+df_imput_plot_data <- df_imput %>%
+  group_by(Year) %>%
+  summarise(GDP = mean(GDP), energy = sum(Energy_Exajoules), .groups = 'drop')
+
+plot_grid(
+  ggplot(df_imput_plot_data, aes(y = GDP, x = Year)) +
+  geom_point() + 
+  labs(title = "GDP per Capita", x = "", y = "Mean GDP per capita - constant US$") +
+  scale_y_continuous(labels = scales::comma),
+  ggplot(df_imput_plot_data, aes(y = energy, x = Year)) +
+  geom_point() + 
+  labs(title = "Energy Consumption", x = "", y = "Energy - Exajoules"))
+```
+
+The numerical summary shows we likely have skewed data with the mean and median for both energy and GDP per capita being proportionally closer to the min value than the max.
+
+```{r numericalsummary}
+# Numerical summary
+summary(df_imput)
+```
+
+This is further demonstrated by visualising the histograms which show right skewed data. Based on this we log-transform the data in order to make it more normally distributed.
+
+```{r plot_hist, fig.align="center", fig.width=8, fig.height=4}
+# Histograms
+title = ggdraw() + 
+  draw_label("Histograms - Original Data", fontface='bold')
+
+plot_grid(title,
+  plot_grid(
+    ggplot(df_imput, aes(GDP)) +
+      geom_histogram(bins = 30, fill = "cyan3", color="white"),
+    ggplot(df_imput, aes(Energy_Exajoules)) +
+      geom_histogram(bins = 30, fill = "cyan3", color="white")),
+  ncol = 1, rel_heights = c(0.1,1))
+
+# Log the data
+df_log <- df_imput %>%
+  mutate(across(c(Energy_Exajoules, GDP), log))
+```
+
+Inspection of the data after log-transformation shows roughly normal distribution for Energy however GDP shows bimodal distribution. When we break this down into the income groups however, we can see roughly normal distributions indicating individual countries are also likely to be normal.
+
+```{r plot_pairs, fig.align="center"}
+ggpairs(df_log, columns = c("GDP", "Energy_Exajoules"), aes(color = Income_Group, alpha = 0.4))
+```
+
+We now observe the relationship between energy consumption and GDP per capita for the different income groups and see a positive linear trend with higher GDP per capita (and thus higher economic development stage) resulting in higher energy consumption.
+
+```{r plot_relationship, message=FALSE, fig.align="center"}
+# Plot energy consumption vs gdp per capita
+par(mfrow=c(1,1))
+plot_log <- df_log %>%
+  group_by(Year, Income_Group) %>%
+  summarise(Energy_Exajoules_log = sum(Energy_Exajoules), GDP_log = mean(GDP)) %>%
+  ggplot(aes(y = Energy_Exajoules_log, x = GDP_log)) +
+    geom_point(aes(color = Income_Group)) +
+    ggtitle("Energy Consumption vs GDP - Grouped by Year") + 
+    theme(plot.title = element_text(hjust = 0.5, size=16))
+
+plot_log
+```
+
+### Box Plots
+
+When analysing the box plots we see that the distribution of both the GDP per capita and energy consumption increase with higher income groups. The changes of GDP per capita and energy consumption appear to be aligned between lower middle income and upper middle income groups. However, between upper middle income and high income group, the increase of GDP per capita leads to a smaller proportional energy consumption increase, meaning the economic growth enters into a more energy-efficient stage. This can be explained by the macroeconomic theory that countries at this stage transform from industry-dominated to service-dominated economic structure. 
+
+```{r plot_box, fig.align="center"}
+# Box plots
+title = ggdraw() + 
+  draw_label("Boxplots by Income Group", fontface='bold')
+
+df_log_plot <- df_log %>%
+  group_by(Year, Income_Group) %>%
+  summarise(Energy_Exajoules_log = sum(Energy_Exajoules), GDP_log = mean(GDP))
+
+plot_box <- function(var, plot_title) {
+  df_log_plot %>%
+  ggplot(aes(x = Income_Group, y = var, fill=Income_Group)) +
+    geom_boxplot(outlier.color = "red") +
+    ggtitle(plot_title) + 
+    theme(plot.title = element_text(hjust = 0.5, size=16), legend.position = "none") +
+    scale_fill_brewer(palette="BuPu") +
+    scale_x_discrete(labels = function(x) str_wrap(x, width=15)) +
+    xlab("")
+}
+
+plot_grid(title,
+  plot_grid(
+    plot_box(df_log_plot$GDP_log, "GDP per Capita"),
+    plot_box(df_log_plot$Energy_Exajoules_log, "Energy Consumption")),
+    ncol = 1, rel_heights = c(0.1,1))
+```
+
+# Fit Model
+
+Given the linear properties previously observed in the data, we choose a fixed effect linear regression using Country as the fixed effect. We fit a linear model to the data and find this represents the data well, with the adjusted R2 score suggesting the model explains around 97% of the energy consumption variable. This result is also supported by the energy economics theory, as economic growth is the main driving force for the increase of energy consumption.
+
+Furthermore, in order to confirm the model is reliable we check the residuals and find they appear to be white noise with the qq plot showing a roughly normal distribution with some curvature in the tails. Therefore we accept the findings of our model. For more details of this model including full coefficients list, please see the attached Appendix. 
+
+```{r model, fig.align="center"}
+# Fit the model
+model_lm <- lm(Energy_Exajoules ~ GDP + Country_Code, data = df_log)
+
+# Inspect the model - full summary details are suppressed for brevity
+summary(model_lm)$adj.r.squared
+
+# Inspect the residuals
+par(mfrow=c(2,2))
+plot(model_lm)
+```
+
+The goal of our analysis is to predict the energy consumption for the next 5 years based on the model, in order to provide better understandings of the future energy consumption patterns and assist energy and climate change policy design.
+
+To predict the energy consumption, we use forecast GDP per capita data from 2019 to 2025 obtained from the IMF: <https://www.imf.org/en/Publications/WEO/weo-database/2020/October/download-entire-database>. 
+
+```{r importGDPfcst, warnings=FALSE, message=FALSE, fig.align="center"}
+
+# Import forecast GDP per capita data
+filepath_gdp_fcst <- "../data/WEOOct2020all.xlsx"
+df_gdp_fcst <- read_excel(filepath_gdp_fcst, sheet="WEOOct2020all")
+
+# Select only relevant data
+df_gdp_fcst <- df_gdp_fcst %>%
+  filter(`Subject Descriptor` == "Gross domestic product per capita, constant prices" & Units == "National currency" & Scale == "Units") %>%
+  select("ISO", "Country", "2019":"2025")
+
+# Keep only countries in df_log
+df_gdp_fcst <- df_gdp_fcst %>%
+  subset(ISO %in% unique(df_log$Country_Code))
+
+# Convert to number
+df_gdp_fcst[,3:length(colnames(df_gdp_fcst))] <- lapply(df_gdp_fcst[,3:length(colnames(df_gdp_fcst))], as.numeric)
+  
+# Drop NA's
+df_gdp_fcst <- df_gdp_fcst[rowSums(is.na(df_gdp_fcst)) == 0,]
+
+# Transform data to year as column
+df_gdp_fcst <- df_gdp_fcst %>%
+  pivot_longer(
+    cols = !c(Country, ISO),
+    names_to = "Year",
+    values_to = "GDP")
+
+# Convert year to integer
+df_gdp_fcst$Year <- as.numeric(df_gdp_fcst$Year)
+
+# Add country categories
+df_gdp_fcst <- df_gdp_fcst %>%
+  rename(Country_Code = ISO) %>%
+  left_join(df_country_cats[,c("Country_Code", "IncomeGroup")], by = "Country_Code") %>%
+  rename(Income_Group = IncomeGroup)
+```
+
+As the IMF GDP per capita data uses the national currency, which is different from our existing data (constant 2010 USD), we use the IMF data to calculate the growth rates that we can then use to calculate the 2020 to 2025 GDP per capita.
+
+```{r gdp_calc}
+# Convert GDP per capital values to growth rates
+df_gdp_fcst <- df_gdp_fcst %>%
+  group_by(Country) %>% 
+  mutate(GDP_growth = (GDP - lag(GDP))/lag(GDP)) %>%
+  select(Country, Country_Code, Year, GDP_growth, Income_Group) %>%
+  drop_na()
+
+plot_gdp_growth <- df_gdp_fcst %>%
+  group_by(Income_Group, Year) %>%
+  summarise(GDP_growth = mean(GDP_growth)) %>%
+  ggplot(aes(y = GDP_growth, x = Year, color = Income_Group)) +
+    geom_line() +
+    labs(title = "Forecast of GDP per Capita Growth by Income Group", y = "GDP Growth") + 
+    theme(plot.title = element_text(hjust = 0.5, size=16)) +
+    scale_y_continuous(labels = scales::percent)
+
+plot_gdp_growth
+
+# Convert to compound growth rate and calculate GDP per capita forecast
+gdp_2019_country <- df_imput[df_imput$Year == 2019, c("Country_Name", "Country_Code", "Year", "GDP")]
+df_gdp_fcst$GDP_growth_comp <- df_gdp_fcst$GDP_growth 
+df_gdp_fcst$GDP_fcst <- 0
+for (country in unique(df_gdp_fcst$Country_Code)){
+  gdp_2019 = gdp_2019_country[gdp_2019_country$Country_Code == country, "GDP"]
+  for (year in unique(df_gdp_fcst$Year)){
+    gdp = df_gdp_fcst[df_gdp_fcst$Country_Code == country & df_gdp_fcst$Year == year,"GDP_growth"]
+    if (year == 2020){
+      # Growth Rate
+      df_gdp_fcst[df_gdp_fcst$Country_Code == country & df_gdp_fcst$Year == year,"GDP_growth_comp"] = gdp
+      # GDP Value
+      df_gdp_fcst[df_gdp_fcst$Country_Code == country & df_gdp_fcst$Year == year,"GDP_fcst"] = gdp_2019 * (1 + gdp)
+    }
+    else {
+    gdp_prior = df_gdp_fcst[df_gdp_fcst$Country_Code == country & df_gdp_fcst$Year == (year - 1),"GDP_growth_comp"]
+    gdp_growth_comp = gdp + (gdp_prior * (1 + gdp))
+    # Growth Rate
+    df_gdp_fcst[df_gdp_fcst$Country_Code == country & df_gdp_fcst$Year == year,"GDP_growth_comp"] = gdp_growth_comp
+    # GDP Value
+    df_gdp_fcst[df_gdp_fcst$Country_Code == country & df_gdp_fcst$Year == year,"GDP_fcst"] = gdp_2019 * (1 + gdp_growth_comp)
+    }
+  }
+}
+
+```
+
+We now use calculated GDP per capita forecasts to predict the energy consumption for each country for 2020 to 2025.
+
+```{r predict}
+# Prepare prediction data for model
+pred_data <- df_gdp_fcst %>%
+  select(Country, Country_Code, Income_Group, Year, GDP_fcst) %>%
+  rename(GDP = GDP_fcst, Country_Name = Country) %>%
+  mutate(GDP = log(GDP))
+
+# Predict future energy consumption
+pred <- predict(model_lm, newdata = pred_data)
+
+# Add prediction data back to dataframe
+pred_data$Energy_Exajoules <- pred
+df_log <- rbind(df_log, pred_data)
+df_log <- df_log[order(df_log$Country_Name, df_log$Year),]
+
+# Quick check of predictions
+plot(pred,
+     main = "Energy Consumption Predictions",
+     ylab = "Energy_Exajoules_log")
+```
+
+## Visualise Predictions
+
+Our results show that the prediction fits the best for the high-income countries, but has some gaps comparing to the actual value for the upper middle income group, and fits the worst for the lower middle income group. We believe that this unexpected behaviour that wasn't represented by the model was caused by the negative GDP predictions for many countries for 2020 due to the COVID-19 pandemic. The pandemic changed the economic growth pattern significantly, and it caused larger negative impacts on countries with relatively lower income, as their economies could be more vulnerable to external shocks. 
+
+We conclude this session with the findings that our model is able to explain the relationship between economic growth and energy consumption well under normal conditions. However, it is too simple to catch the sudden structural change of economic variables - a much larger number of variables would need to be analysed in order to provide more precise policy implications in the fields of energy and climate change and given the effect of coronavirus on the economy, the relationship between energy use and GDP may exhibit different patterns in the near future from what has previously been observed. 
+
+Nevertherless, our model confirms that the total energy consumption in all three groups will continue to grow, even with a slower speed, thus increasing the share of renewable energy in the energy mix is the key to slow down (if not reduce) the global greenhouse gas emissions. 
+
+```{r predict_plot, fig.align="center"}
+df_log$Actual_Forecast <- NA
+df_log$Actual_Forecast[df_log$Year >= 2020] <- "Fcst"
+df_log$Actual_Forecast[df_log$Year < 2020] <- "Actual"
+
+# Plot energy consumption vs gdp
+par(mfrow=c(1,1))
+plot_log <- df_log %>%
+  group_by(Year, Income_Group, Actual_Forecast) %>%
+  summarise(Energy_Exajoules_log = sum(Energy_Exajoules), GDP_log = mean(GDP)) %>%
+  ggplot(aes(y = Energy_Exajoules_log, x = GDP_log)) +
+    geom_point(aes(color = Income_Group, shape=Actual_Forecast)) +
+    ggtitle("Energy Consumption vs GDP - Grouped by Year") + 
+    theme(plot.title = element_text(hjust = 0.5, size=16))
+
+plot_log
+```
+
+```{r predict_plot2, fig.align="center", fig.width=8, fig.height=5}
+df_pred_plot <- df_log %>%
+  group_by(Year, Income_Group) %>%
+  summarise(GDP = mean(GDP), energy = sum(Energy_Exajoules), .groups = 'drop')
+
+plot_predict <- function(y_var, pred_title, ylab) {
+  ggplot(df_pred_plot, aes(x = Year, y = y_var, color = Income_Group)) +
+  geom_point() + 
+  labs(title = pred_title, y = ylab, x = "") + 
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = c(.85, .1), legend.key.size = unit(0.1, "lines"),
+        legend.title = element_text(size=7), legend.text = element_text(size=5.5)) +
+  guides(color = guide_legend(override.aes = list(size = 0.7)))
+}
+
+plot_grid(plot_predict(df_pred_plot$GDP, "GDP per Capital", "GDP - constant US$ - Avg Per Income Group"), 
+          plot_predict(df_pred_plot$energy, "Energy Consumption", "Energy - Exajoules"))
+```
+
+# A Chapter of our Choice - Map Visualisation
+
+Here we use a variety of maps packages to visualise our data on a global map level in order to reveal the insights of different energy and climate change policies in different countries. Further, we also provide some policy suggestions for countries at different development stages to assist policymakers to find low-carbon development approaches that fit them the best.
+
+```{r maps_prepare, message=FALSE}
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rgeos)
+library(ggspatial)
+library(RColorBrewer)
+
+# Unlog data
+df_norm <- df_log
+df_norm$GDP <- exp(df_log$GDP)
+df_norm$Energy_Exajoules <- exp(df_log$Energy_Exajoules)
+
+# Get Map Data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Join country data from our analysis
+world_2019 <- merge(world, df_norm[df_norm$Year == 2019, ], by.x = "iso_a3", by.y = "Country_Code", all.x = TRUE)
+world_2025 <- merge(world, df_norm[df_norm$Year == 2025, ], by.x = "iso_a3", by.y = "Country_Code", all.x = TRUE)
+
+# extract locations and labels
+world_points <- st_centroid(world_2019)
+world_points <- cbind(world_2019, st_coordinates(st_centroid(world_2019$geometry)))
+world_points <- world_points[world_points$iso_a3 %in% unique(df_norm$Country_Code),] 
+```
+
+From the colouring of the graphs below we are immediately able to see some discrepanies between GDP per capita and energy consumption. For example, China has a much higher energy intensity (here energy intensity defined as energy consumption/GDP per capita) than Canada and Australia, this can largely be attributed to China still going through a fast industrialization and urbanization process while the other two countries have completed these processes and are at the service-industry-dominated economic development stage. We assume that for many emerging countries, such as Vietnam and Indonesia, as their economies grow, it is hard to avoid this high-energy-intensity stage. If these emerging economies rely heavily on the fossil-fuel-dominated energy mix, they will also face huge challenges to control or reduce their greenhouse gas emissions.
+
+There are two possible approaches for emerging economies to alleviate the energy and climate change impacts. The first and the most effective way is low-carbon energy transition that helps countries rely on renewable and low-carbon energies, instead of conventional fossil fuels. The second approach is to upgrade industries while going through the industrialization process, so the energy-intensive development stage can be shortened. 
+
+```{r map_gdp, fig.align="center"}
+
+plot_map <- function(df, fill_var, legend_label, xlab) {
+  ggplot() +
+  geom_sf(data = df, aes(fill = fill_var)) +
+  labs(x = xlab, y = "Latitude", fill = legend_label) +
+  coord_sf(xlim = c(-120.00, 180.00), ylim = c(-50.00, 80.00)) +
+  theme(panel.background = element_rect(fill = "aliceblue")) +
+  geom_text(data = world_points,aes(x=X, y=Y, label=name), color = "orange", 
+            fontface = "italic", check_overlap = T, size = 3) + 
+  scale_fill_continuous(labels = scales::comma)
+}
+
+# generate world maps and align plots
+title = ggdraw() + 
+  draw_label("GDP per Capita and Energy Consumption Across the World - 2019", fontface='bold')
+
+plot_grid(title,
+  plot_grid(
+    plot_map(world_2019, world_2019$GDP, "GDP", "Longitude"),
+    plot_map(world_2019, world_2019$Energy_Exajoules, "Energy_Exajoules", "Longitude"), 
+    nrow=2, align = "v"),
+    ncol = 1, rel_heights = c(0.1,1))
+```
+
+When we look at the future forecast levels of energy consumption in 2025 vs 2019, we see that the energy consumption pattern is not expected to change in the next five years, which shows a high pressure on achieving the global climate change targets, unless countries across the world are able to break the conventional way of using fossil fuels to drive the economic growth. 
+
+```{r map_energy, fig.align="center"}
+
+# generate world maps - energy
+title = ggdraw() + 
+  draw_label("Forecast Energy Consumption Change 2019 to 2025", fontface='bold')
+
+plot_grid(title,
+  plot_grid(
+    plot_map(world_2019, world_2019$Energy_Exajoules, "Energy_Exajoules", "2019"),
+    plot_map(world_2025, world_2025$Energy_Exajoules, "Energy_Exajoules", "2025"), 
+    nrow=2, align = "v"),
+    ncol = 1, rel_heights = c(0.1,1))
+
+```
+
+We can also zoom in to Americas to take a closer look at their Energy to GDP per capita relationships. Firstly, Canada and the US are both in the high income group and have similar energy efficiency levels. The difference between their energy consumption is mainly caused by the population difference, as the US population is about 9 times of Canada's population. Secondly, other countries such as Mexico, Brazil, and Argentina are currently all in the upper middle income group, although their energy consumption levels are relatively low, much faster growth can be expected if they could realize faster economic growth and enter the high income group. Thirdly, while Brazil has a much larger population compared to other countries in the same income group, it shows a better energy efficiency level. 
+
+```{r map_europe, fig.align="center"}
+# Get Map Data
+americas <- ne_countries(returnclass = "sf", continent = c("North America", "South America"))
+
+# Join country data from our analysis
+americas_2019 <- merge(americas, df_norm[df_norm$Year == 2019, ], by.x = "iso_a3", by.y = "Country_Code", all.x = TRUE)
+americas_2025 <- merge(americas, df_norm[df_norm$Year == 2025, ], by.x = "iso_a3", by.y = "Country_Code", all.x = TRUE)
+
+# extract locations and labels
+world_points <- st_centroid(americas_2019)
+world_points <- cbind(americas_2019, st_coordinates(st_centroid(americas_2019$geometry)))
+world_points <- world_points[world_points$iso_a3 %in% unique(df_norm$Country_Code),] 
+
+plot_map_europe <- function(df, fill_var, legend_label, xlab) {
+  ggplot() +
+  geom_sf(data = df, aes(fill = fill_var)) +
+  labs( x = xlab, y = "", fill = legend_label) +
+  coord_sf(xlim = c(-150.00, -25.00), ylim = c(-50, 75), expand = FALSE) +
+  theme(panel.background = element_rect(fill = "aliceblue"),
+        axis.text.x = element_blank(), axis.text.y = element_blank(), axis.ticks = element_blank()) +
+  geom_text(data = world_points,aes(x=X, y=Y, label=name), color = "orange", 
+            fontface = "italic", check_overlap = T, size = 3) + 
+  scale_fill_continuous(labels = scales::comma)
+}
+
+# generate and align plots
+title = ggdraw() + 
+  draw_label("GDP per Capita and Energy Consumption - Americas - 2019 vs 2025", fontface='bold')
+
+plot_grid(title,
+  plot_grid(
+    plot_map_europe(americas_2019, americas_2019$GDP, "GDP", "2019"),
+    plot_map_europe(americas_2025, americas_2025$GDP, "GDP", "2025"), 
+    plot_map_europe(americas_2019, americas_2019$Energy_Exajoules, "Energy_Exajoules", "2019"),
+    plot_map_europe(americas_2025, americas_2025$Energy_Exajoules, "Energy_Exajoules", "2025"), 
+    nrow=2, ncol=2, align = "hv"),
+    ncol = 1, rel_heights = c(0.1,1))
+```
+
+# Conclusion
+
+This analyis chooses energy consumption and GDP per capita to analyze the relationship between these two variables and forecast the energy consumption over the next 5 years, aiming to assist policy development in energy and climate change fields. Our main findings are summarized as follows:
+
+* Our linear model shows positive impacts of GDP per capita on energy consumption in most countries, and its p-value confirms that the impact is significant. The model represents the data well, with the adjusted R2 score suggesting the model explains around 97% of the energy consumption variable. This result is also supported by the energy economics theory, as economic growth is the main driving force for increases in energy consumption.
+
+* Based on this model, we predict the energy consumption for the next 5 years to support the future energy and climate change policy design. The prediction shows a drop in total energy consumption in 2020 however with the trend in all three groups showing continued growth. This drop should be taken with extreme caution due to abnormal circumstances of coronavirus and negative GDP growth. However, taking note of the trend for increased consumption, even with a slower rate of growth, increasing the share of renewable energy in the energy mix is the key to slow down (if not reduce) the global greenhouse gas emissions. 
+
+* Our model also has a limitation that it only uses GDP per capita to explain the energy consumption. It is inevitable that the model misses some important information of the economic and energy systems, especially when there is a sudden and significant structural change of economic variables such as the shock caused by the COVID-19 pandemic. This could be a future improvement to implement in this model. 
+
+* When looking at countries worldwide and comparing the current and future development, our model shows that the energy consumption pattern will not change in the near future for all three income groups, which will put a high pressure on achieving the global climate change targets, unless countries across the world are able to break the conventional way of using fossil fuels to drive the economic growth. Countries at different development stages should seek the low-carbon transition paths that best suit their economic situations. 
+
+
+# Appendix - Summary Model Results
+
+```{r}
+# Summary model results
+summary(model_lm)
+```
+
