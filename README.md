@@ -1,7 +1,7 @@
 # Analysis of the relationship between Energy Consumption and GDP per Capita worldwide.
 R Bootcamp Assignment - Feb 2021
 
-### Report File: https://traceyetheridge.github.io/Energy-vs-GDP/Energy%20vs%20GDP%20-%20Report.html
+### Report File: <https://traceyetheridge.github.io/Energy-vs-GDP/Energy%20vs%20GDP%20-%20Report.html>
 
 ## Project description
 Total energy consumption is the key factor in each country's energy and climate change policy, which is influenced by economic growth, industrialization, urbanization, etc. This analyis chooses one of the most important influencing factors, GDP per capita, to analyze the relationship between these two variables and forecast the energy consumption in the next 5 years, which can be used to assist policy development in energy and climate change fields.
